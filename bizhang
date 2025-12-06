@@ -1,0 +1,468 @@
+#include <ros/ros.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <sensor_msgs/LaserScan.h>
+#include <mavros_msgs/CommandBool.h>
+#include <mavros_msgs/SetMode.h>
+#include <mavros_msgs/State.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+
+class RobustObstacleAvoidance {
+private:
+    ros::NodeHandle nh;
+    
+    ros::Publisher local_pos_pub;
+    ros::Subscriber state_sub;
+    ros::Subscriber lidar_sub;
+    
+    ros::ServiceClient arming_client;
+    ros::ServiceClient set_mode_client;
+    
+    mavros_msgs::State current_state;
+    sensor_msgs::LaserScan current_scan;
+    bool lidar_data_received;
+    
+    // 门检测相关
+    struct GateDetectionResult {
+        bool gate_detected;
+        double left_post_distance;
+        double right_post_distance;  
+        double gate_center_offset;
+    };
+    
+    // 改进的门检测
+    GateDetectionResult detectGate() {
+        GateDetectionResult result;
+        result.gate_detected = false;
+        result.gate_center_offset = 0.0;
+        
+        if (!lidar_data_received) return result;
+        
+        int num_readings = current_scan.ranges.size();
+        int gate_angle_range = num_readings * 15 / 180;
+        
+        // 左门柱检测：+10°到+25°
+        int left_start = num_readings/2 + num_readings*10/180;
+        int left_end = left_start + gate_angle_range;
+        
+        // 右门柱检测：-25°到-10°
+        int right_end = num_readings/2 - num_readings*10/180;
+        int right_start = right_end - gate_angle_range;
+        
+        double left_min = 10.0, right_min = 10.0;
+        int left_count = 0, right_count = 0;
+        
+        // 检测左门柱
+        for (int i = left_start; i < left_end && i < num_readings; ++i) {
+            float range_val = current_scan.ranges[i];
+            if (!std::isinf(range_val) && !std::isnan(range_val) && range_val < 3.0) {
+                double range = static_cast<double>(range_val);
+                if (range < left_min) left_min = range;
+                left_count++;
+            }
+        }
+        
+        // 检测右门柱
+        for (int i = right_start; i < right_end && i >= 0; ++i) {
+            float range_val = current_scan.ranges[i];
+            if (!std::isinf(range_val) && !std::isnan(range_val) && range_val < 3.0) {
+                double range = static_cast<double>(range_val);
+                if (range < right_min) right_min = range;
+                right_count++;
+            }
+        }
+        
+        // 判断是否为门
+        if (left_count > 3 && right_count > 3 && 
+            left_min < 2.5 && right_min < 2.5 && 
+            fabs(left_min - right_min) < 0.8) {
+            
+            result.gate_detected = true;
+            result.left_post_distance = left_min;
+            result.right_post_distance = right_min;
+            result.gate_center_offset = (right_min - left_min) / 2.0;
+            
+            ROS_INFO("GATE DETECTED: left=%.2fm, right=%.2fm, center_offset=%.2fm", 
+                    left_min, right_min, result.gate_center_offset);
+        }
+        
+        return result;
+    }
+    
+    // 避障参数
+    const double SAFE_DISTANCE = 2.0;
+    const double EMERGENCY_DISTANCE = 1.5;
+    const double GATE_EMERGENCY_DISTANCE = 2.0;
+    const double MAX_SPEED = 0.8;
+    const double CRUISE_SPEED = 0.4;
+    const double SLOW_SPEED = 0.2;
+    
+    // 简化状态机：删除所有通道相关状态
+    enum MissionState {
+        TAKEOFF, 
+        HOVERING, 
+        CRUISING, 
+        AVOIDING, 
+        GATE_APPROACH,
+        GATE_ALIGNMENT,
+        GATE_PASSING,
+        DIRECT_TO_TARGET,  // 修改：直接从门飞到目标点
+        HOVER_AT_TARGET,
+        MISSION_COMPLETE
+    };
+    
+    MissionState current_mission_state;
+    ros::Time state_start_time;
+    geometry_msgs::PoseStamped target_pose;
+
+    // 碰撞检测
+    struct ObstacleInfo {
+        bool obstacle_detected;
+        double min_distance;
+        double obstacle_angle;
+        bool emergency_stop;
+    };
+    
+    ObstacleInfo checkCollisionRisk() {
+        ObstacleInfo info;
+        info.obstacle_detected = false;
+        info.min_distance = 10.0;
+        info.emergency_stop = false;
+        info.obstacle_angle = 0.0;
+        
+        if (!lidar_data_received) return info;
+        
+        int num_readings = current_scan.ranges.size();
+        int front_start = num_readings * 1/4;
+        int front_end = num_readings * 3/4;
+        
+        bool is_in_gate_area = (target_pose.pose.position.x >= 20.0 && 
+                               target_pose.pose.position.x <= 24.0);
+        double emergency_threshold = is_in_gate_area ? 
+                                    GATE_EMERGENCY_DISTANCE : EMERGENCY_DISTANCE;
+        
+        for (int i = front_start; i < front_end; ++i) {
+            float range_val = current_scan.ranges[i];
+            if (std::isinf(range_val) || std::isnan(range_val)) continue;
+            
+            double range = static_cast<double>(range_val);
+            if (range < info.min_distance) {
+                info.min_distance = range;
+                info.obstacle_angle = current_scan.angle_min + i * current_scan.angle_increment;
+            }
+            
+            if (range < emergency_threshold) {
+                info.emergency_stop = true;
+            }
+            
+            if (range < SAFE_DISTANCE) {
+                info.obstacle_detected = true;
+            }
+        }
+        
+        return info;
+    }
+    
+    // 避障决策
+    struct AvoidanceDecision {
+        double forward_speed;
+        double lateral_speed;
+        bool should_avoid;
+    };
+    
+    AvoidanceDecision makeAvoidanceDecision(const ObstacleInfo& obstacle) {
+        AvoidanceDecision decision;
+        decision.should_avoid = false;
+        
+        // 门区域特殊处理
+        bool is_in_gate_area = (target_pose.pose.position.x >= 20.0 && 
+                               target_pose.pose.position.x <= 24.0);
+        
+        if (is_in_gate_area) {
+            GateDetectionResult gate = detectGate();
+            
+            if (gate.gate_detected) {
+                if (fabs(gate.gate_center_offset) > 0.05) {
+                    decision.forward_speed = SLOW_SPEED;
+                    decision.lateral_speed = -gate.gate_center_offset * 0.5;
+                    decision.should_avoid = false;
+                    ROS_WARN("GATE ALIGNMENT: offset=%.2fm, adjusting", gate.gate_center_offset);
+                } else {
+                    decision.forward_speed = CRUISE_SPEED;
+                    decision.lateral_speed = 0.0;
+                    decision.should_avoid = false;
+                    ROS_WARN("GATE CENTERED - Passing through!");
+                }
+                return decision;
+            }
+        }
+        
+        // 正常避障逻辑
+        if (obstacle.emergency_stop) {
+            decision.should_avoid = true;
+            decision.forward_speed = SLOW_SPEED * 0.3;
+            
+            if (obstacle.obstacle_angle > 0) {
+                decision.lateral_speed = -0.3;
+                ROS_WARN("EMERGENCY: Avoiding RIGHT! Distance: %.2fm", obstacle.min_distance);
+            } else {
+                decision.lateral_speed = 0.3;
+                ROS_WARN("EMERGENCY: Avoiding LEFT! Distance: %.2fm", obstacle.min_distance);
+            }
+        }
+        else if (obstacle.obstacle_detected) {
+            decision.should_avoid = true;
+            
+            if (obstacle.min_distance < SAFE_DISTANCE * 0.7) {
+                decision.forward_speed = SLOW_SPEED;
+            } else {
+                decision.forward_speed = CRUISE_SPEED * 0.5;
+            }
+            
+            if (obstacle.obstacle_angle > 0) {
+                decision.lateral_speed = -0.3;
+                ROS_INFO("Avoiding RIGHT - distance: %.2fm", obstacle.min_distance);
+            } else {
+                decision.lateral_speed = 0.3;
+                ROS_INFO("Avoiding LEFT - distance: %.2fm", obstacle.min_distance);
+            }
+        }
+        else {
+            decision.forward_speed = CRUISE_SPEED;
+            decision.lateral_speed = 0.0;
+            decision.should_avoid = false;
+        }
+        
+        return decision;
+    }
+
+public:
+    RobustObstacleAvoidance() : lidar_data_received(false), current_mission_state(TAKEOFF) {
+        nh.setParam("/use_sim_time", true);
+        
+        local_pos_pub = nh.advertise<geometry_msgs::PoseStamped>("mavros/setpoint_position/local", 10);
+        state_sub = nh.subscribe<mavros_msgs::State>("mavros/state", 10, &RobustObstacleAvoidance::stateCallback, this);
+        lidar_sub = nh.subscribe<sensor_msgs::LaserScan>("/laser/scan", 10, &RobustObstacleAvoidance::lidarCallback, this);
+        
+        arming_client = nh.serviceClient<mavros_msgs::CommandBool>("mavros/cmd/arming");
+        set_mode_client = nh.serviceClient<mavros_msgs::SetMode>("mavros/set_mode");
+        
+        initializeTargetPose();
+        state_start_time = ros::Time::now();
+    }
+
+    void initializeTargetPose() {
+        target_pose.header.frame_id = "map";
+        target_pose.pose.position.x = 0.0;
+        target_pose.pose.position.y = 0.0;
+        target_pose.pose.position.z = 1.5;
+        
+        tf2::Quaternion q;
+        q.setRPY(0, 0, 0);
+        target_pose.pose.orientation = tf2::toMsg(q);
+    }
+
+    void stateCallback(const mavros_msgs::State::ConstPtr& msg) {
+        current_state = *msg;
+    }
+
+    void lidarCallback(const sensor_msgs::LaserScan::ConstPtr& msg) {
+        current_scan = *msg;
+        lidar_data_received = true;
+    }
+
+    bool setMode(const std::string& mode) {
+        mavros_msgs::SetMode srv;
+        srv.request.custom_mode = mode;
+        return set_mode_client.call(srv);
+    }
+
+    bool arm() {
+        mavros_msgs::CommandBool srv;
+        srv.request.value = true;
+        return arming_client.call(srv);
+    }
+
+    void run() {
+        ros::Rate rate(20.0);
+        
+        while (ros::ok() && !current_state.connected) {
+            ros::spinOnce();
+            rate.sleep();
+        }
+        
+        ROS_INFO("FCU connected");
+        
+        for (int i = 100; ros::ok() && i > 0; --i) {
+            target_pose.header.stamp = ros::Time::now();
+            local_pos_pub.publish(target_pose);
+            ros::spinOnce();
+            rate.sleep();
+        }
+        
+        if (setMode("OFFBOARD") && arm()) {
+            ROS_INFO("OFFBOARD mode set and armed");
+        } else {
+            ROS_ERROR("Failed to set OFFBOARD mode or arm");
+            return;
+        }
+        
+        while (ros::ok()) {
+            ObstacleInfo obstacle_info = checkCollisionRisk();
+            AvoidanceDecision decision = makeAvoidanceDecision(obstacle_info);
+            
+            switch (current_mission_state) {
+                case TAKEOFF:
+                    target_pose.pose.position.z = 1.5;
+                    if (current_state.mode == "OFFBOARD" && current_state.armed) {
+                        current_mission_state = HOVERING;
+                        state_start_time = ros::Time::now();
+                        ROS_INFO("Takeoff complete, starting hover");
+                    }
+                    break;
+                    
+                case HOVERING:
+                    if ((ros::Time::now() - state_start_time).toSec() >= 10.0) {
+                        current_mission_state = CRUISING;
+                        ROS_INFO("Hover complete, starting navigation");
+                    }
+                    break;
+                    
+                case CRUISING:
+                    if (decision.should_avoid) {
+                        current_mission_state = AVOIDING;
+                        ROS_INFO("Obstacle detected, switching to avoidance mode");
+                    } else {
+                        target_pose.pose.position.x += decision.forward_speed * 0.05;
+                    }
+                    
+                    if (target_pose.pose.position.x >= 18.0) {
+                        current_mission_state = GATE_APPROACH;
+                        ROS_INFO("Approaching gate area at x=%.2f", target_pose.pose.position.x);
+                    }
+                    break;
+                    
+                case AVOIDING:
+                    target_pose.pose.position.x += decision.forward_speed * 0.05;
+                    target_pose.pose.position.y += decision.lateral_speed * 0.05;
+                    
+                    if (!decision.should_avoid) {
+                        current_mission_state = CRUISING;
+                        ROS_INFO("Avoidance complete, returning to cruise");
+                    }
+                    break;
+                 
+                case GATE_APPROACH: {
+                    GateDetectionResult gate = detectGate();
+                    
+                    if (gate.gate_detected) {
+                        current_mission_state = GATE_ALIGNMENT;
+                        ROS_INFO("Gate detected, starting alignment");
+                    } else {
+                        target_pose.pose.position.x += 0.1;
+                        ROS_INFO_THROTTLE(1.0, "Searching for gate at x=%.2f...", target_pose.pose.position.x);
+                    }
+                    break;
+                }
+
+                case GATE_ALIGNMENT: {
+                    GateDetectionResult gate = detectGate();
+                    
+                    if (gate.gate_detected) {
+                        if (fabs(gate.gate_center_offset) < 0.05) {
+                            current_mission_state = GATE_PASSING;
+                            ROS_INFO("Gate aligned! Passing through");
+                        }
+                    } else {
+                        ROS_WARN("Gate lost during alignment");
+                        current_mission_state = GATE_APPROACH;
+                    }
+                    break;
+                }
+
+                case GATE_PASSING:
+                    target_pose.pose.position.x += decision.forward_speed * 0.05;
+                    target_pose.pose.position.y += decision.lateral_speed * 0.05;
+                    
+                    ROS_INFO_THROTTLE(0.5, "Passing gate: x=%.2f, y=%.2f", 
+                                     target_pose.pose.position.x, target_pose.pose.position.y);
+                    
+                    // 关键修改：通过门后直接进入直线飞行到目标点
+                    if (target_pose.pose.position.x > 24.0) {
+                        current_mission_state = DIRECT_TO_TARGET;
+                        ROS_INFO("Gate passed! Flying directly to target (28, 0, 1.5)");
+                    }
+                    break;
+
+                case DIRECT_TO_TARGET: {
+                    // 直接从当前位置直线飞到目标点(28, 0, 1.5)
+                    double target_x = 28.0;
+                    double target_y = 0.0;
+                    
+                    // 计算当前位置到目标点的误差
+                    double error_x = target_x - target_pose.pose.position.x;
+                    double error_y = target_y - target_pose.pose.position.y;
+                    
+                    // 简单直线飞行：同时调整x和y
+                    if (fabs(error_x) > 0.1) {
+                        // 向目标点前进
+                        target_pose.pose.position.x += 0.2;  // 固定速度前进
+                    }
+                    
+                    if (fabs(error_y) > 0.1) {
+                        // 调整y到0
+                        double y_adjust = error_y * 0.2;
+                        target_pose.pose.position.y += y_adjust;
+                    }
+                    
+                    ROS_INFO("DIRECT_TO_TARGET: x=%.2f, y=%.2f, error_x=%.2f, error_y=%.2f",
+                            target_pose.pose.position.x, target_pose.pose.position.y,
+                            error_x, error_y);
+                    
+                    // 到达目标点附近
+                    if (fabs(error_x) < 0.1 && fabs(error_y) < 0.1) {
+                        current_mission_state = HOVER_AT_TARGET;
+                        state_start_time = ros::Time::now();
+                        ROS_INFO("Reached target area (28, 0, 1.5), starting hover");
+                    }
+                    break;
+                }
+
+                case HOVER_AT_TARGET:
+                    {
+                        double hover_time = (ros::Time::now() - state_start_time).toSec();
+                        if (hover_time < 5.0) {
+                            ROS_INFO_THROTTLE(1.0, "Hovering at target for recognition: %.1f/5.0s", hover_time);
+                        } else {
+                            current_mission_state = MISSION_COMPLETE;
+                            ROS_INFO("=== MISSION COMPLETED ===");
+                            ROS_INFO("Ready for recognition task at (28, 0, 1.5)");
+                        }
+                    }
+                    break;
+                    
+                case MISSION_COMPLETE:
+                    break;
+            }
+            
+            target_pose.pose.position.z = 1.5;
+            
+            target_pose.header.stamp = ros::Time::now();
+            local_pos_pub.publish(target_pose);
+            
+            ros::spinOnce();
+            rate.sleep();
+        }
+    }
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "robust_obstacle_avoidance_node");
+    RobustObstacleAvoidance node;
+    node.run();
+    return 0;
+}
